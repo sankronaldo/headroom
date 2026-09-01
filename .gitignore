@@ -270,3 +270,4 @@ uv.lock
 .tokensave
 
 .codebase-memory/
+.venv_cpa/
