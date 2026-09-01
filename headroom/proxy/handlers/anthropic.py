@@ -343,6 +343,21 @@ class AnthropicHandlerMixin:
 
         return await count_tokens_offloaded(self, model, messages)
 
+    def _cpa_pipeline_kwargs(self, session_id: str) -> dict:
+        """Merge static profile kwargs with CPA pressure overrides.
+
+        CPA kwargs override profile values so that elevated pressure always
+        results in more aggressive compression, regardless of the saved profile.
+        Returns an empty dict on the first turn of a session (before any
+        provider response has been observed) so the pipeline uses its defaults.
+        """
+        from headroom.agent_savings import proxy_pipeline_kwargs
+        from headroom.proxy.pressure_state import PressureStateStore
+
+        pressure_store: PressureStateStore = getattr(self, "_pressure_store", None)  # type: ignore[assignment]
+        pressure_kwargs = pressure_store.get_pipeline_kwargs(session_id) if pressure_store else {}
+        return {**proxy_pipeline_kwargs(self.config), **pressure_kwargs}
+
     @staticmethod
     def _resolve_ccr_workspace(
         request: Any,
@@ -1792,7 +1807,7 @@ class AnthropicHandlerMixin:
                                     request_id=request_id,
                                     compression_policy=compression_policy,
                                     cache_ttl_seconds=_cc_ttl,
-                                    **proxy_pipeline_kwargs(self.config),
+                                    **self._cpa_pipeline_kwargs(session_id),
                                 ),
                                 lambda bg_result: comp_cache.update_from_result(
                                     messages, bg_result.messages
@@ -1838,7 +1853,7 @@ class AnthropicHandlerMixin:
                                             compression_policy=compression_policy,
                                             cache_ttl_seconds=_cc_ttl,
                                             skip_kompress=True,
-                                            **proxy_pipeline_kwargs(self.config),
+                                            **self._cpa_pipeline_kwargs(session_id),
                                         ),
                                         timeout=COLD_START_FAST_PASS_TIMEOUT_SECONDS,
                                     )
@@ -1888,7 +1903,7 @@ class AnthropicHandlerMixin:
                                         request_id=request_id,
                                         compression_policy=compression_policy,
                                         cache_ttl_seconds=_cc_ttl,
-                                        **proxy_pipeline_kwargs(self.config),
+                                        **self._cpa_pipeline_kwargs(session_id),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                                 )
@@ -1930,7 +1945,7 @@ class AnthropicHandlerMixin:
                                     request_id=request_id,
                                     compression_policy=compression_policy,
                                     cache_ttl_seconds=_cc_ttl,
-                                    **proxy_pipeline_kwargs(self.config),
+                                    **self._cpa_pipeline_kwargs(session_id),
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
                             )
@@ -1990,7 +2005,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
-                                        **proxy_pipeline_kwargs(self.config),
+                                        **self._cpa_pipeline_kwargs(session_id),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                                 )
@@ -2063,7 +2078,7 @@ class AnthropicHandlerMixin:
                                         request_id=request_id,
                                         compression_policy=compression_policy,
                                         cache_ttl_seconds=_cc_ttl,
-                                        **proxy_pipeline_kwargs(self.config),
+                                        **self._cpa_pipeline_kwargs(session_id),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                                 )
@@ -3453,6 +3468,28 @@ class AnthropicHandlerMixin:
                                 0, attempted_input_tokens - cr_tokens - cw_tokens
                             )
 
+                        # CPA: update session pressure from confirmed provider token count.
+                        # provider_input_tokens = uncached + cache_read + cache_write
+                        # is the true billed token count for this turn, matching what
+                        # context_limit is measured against.
+                        _cpa_provider_tokens = uncached_input_tokens + cr_tokens + cw_tokens
+                        if _cpa_provider_tokens > 0:
+                            _cpa_context_limit = self.anthropic_provider.get_context_limit(model)
+                            _cpa_level = self._pressure_store.update(
+                                session_id, _cpa_provider_tokens, _cpa_context_limit
+                            )
+                            if self._pressure_store.get_or_create(session_id).is_elevated():
+                                logger.info(
+                                    "[%s] CPA: pressure=%.1f%% level=%s"
+                                    " (session=%s tokens=%d limit=%d)",
+                                    request_id,
+                                    _cpa_provider_tokens / _cpa_context_limit * 100,
+                                    _cpa_level.value,
+                                    session_id[:8],
+                                    _cpa_provider_tokens,
+                                    _cpa_context_limit,
+                                )
+
                         # Update prefix cache tracker for next turn. Mirrors the
                         # direct-Anthropic-API branch below (~line 3011) — without
                         # this, PrefixCacheTracker never sees a turn 2+ update on
@@ -4404,6 +4441,22 @@ class AnthropicHandlerMixin:
                                     f"tokens_lost={bust_tokens:,} tokens_saved={tokens_saved:,}"
                                 )
                                 await self.metrics.record_cache_bust(bust_tokens)
+
+                        # CPA: update session pressure from direct-API confirmed token count.
+                        _cpa_direct_tokens = uncached_input_tokens + cr_tokens + cw_tokens
+                        if _cpa_direct_tokens > 0:
+                            _cpa_ctx_limit = self.anthropic_provider.get_context_limit(model)
+                            _cpa_lvl = self._pressure_store.update(
+                                session_id, _cpa_direct_tokens, _cpa_ctx_limit
+                            )
+                            if self._pressure_store.get_or_create(session_id).is_elevated():
+                                logger.info(
+                                    "[%s] CPA: pressure=%.1f%% level=%s (session=%s)",
+                                    request_id,
+                                    _cpa_direct_tokens / _cpa_ctx_limit * 100,
+                                    _cpa_lvl.value,
+                                    session_id[:8],
+                                )
 
                         # Update prefix cache tracker for next turn
                         next_original_messages = copy.deepcopy(original_client_messages)

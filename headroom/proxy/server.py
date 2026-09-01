@@ -1027,6 +1027,13 @@ class HeadroomProxy(
             )
         )
 
+        # Context Pressure-Aware Compression (CPA): per-session feedback store.
+        # Updated from provider usage after each response; read at compression
+        # time to escalate SmartCrusher aggressiveness as the context window fills.
+        from headroom.proxy.pressure_state import PressureStateStore
+
+        self._pressure_store = PressureStateStore()
+
         # Compression cache store for token mode (session-scoped). The dict
         # itself is mutated under `_compression_caches_lock`; the per-session
         # `CompressionCache` instances have their own internal lock guarding
